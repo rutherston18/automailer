@@ -68,6 +68,20 @@ def get_sheet_data(sheets_service, spreadsheet_id):
         st.error(f"Failed to read Google Sheet. Check link and permissions. Error: {e}")
         return pd.DataFrame(), [], ""
 
+def update_google_sheet_batch(sheets_service, spreadsheet_id, sheet_name, start_row, start_col, data_values):
+    """Updates a range of cells in the Google Sheet in one batch call."""
+    try:
+        start_col_letter = chr(65 + start_col)
+        range_to_update = f"{sheet_name}!{start_col_letter}{start_row}"
+        body = {'values': data_values}
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range=range_to_update,
+            valueInputOption="USER_ENTERED", body=body
+        ).execute()
+    except Exception as e:
+        st.warning(f"Failed to perform batch update on sheet. Error: {e}")
+
+
 # --- EMAIL SENDING FUNCTIONS ---
 def send_initial_email(service, to_email, subject, html_body_template, row_data):
     """Creates and sends a new personalized HTML email."""
@@ -150,7 +164,6 @@ if gmail_service and sheets_service:
                             for i, row in df.iterrows():
                                 if pd.isna(row.get('email')) or not row.get('email'): continue
                                 st.write(f"Row {i+2}: Sending to **{row.get('email')}**...")
-                                # --- FIX: Corrected the arguments passed to the function ---
                                 result = send_initial_email(gmail_service, row.get('email'), subject_input, html_template, row.to_dict())
                                 if result:
                                     sent_emails_info.append({"row_index": i, "temp_id": result['id'], "thread_id": result['threadId'], "subject": subject_input.format(**row.to_dict())})
@@ -163,7 +176,7 @@ if gmail_service and sheets_service:
                         if sent_emails_info:
                             with st.expander("Live Log Status", expanded=True):
                                 st.write("\n--- Phase 2: Fetching Message IDs (Please Wait) ---")
-                                time.sleep(5) # Deliberate pause for Google's servers
+                                time.sleep(5)
                                 for sent_item in sent_emails_info:
                                     i = sent_item["row_index"]
                                     st.write(f"Row {i+2}: Fetching Message-ID for contact...")
@@ -180,24 +193,28 @@ if gmail_service and sheets_service:
                         # --- PHASE 3: UPDATE GOOGLE SHEET IN ONE BATCH ---
                         st.info("--- Phase 3: Updating Google Sheet with logs ---")
                         log_headers = ["Timestamp", "Status", "Subject", "Thread ID", "Message ID"]
-                        for header in log_headers:
-                            if header not in df.columns:
-                                df[header] = ''
+                        original_header_count = len(headers)
+                        new_headers_to_add = [h for h in log_headers if h not in headers]
                         
-                        for row_index, log_data in update_log.items():
-                            for col_name, value in log_data.items():
-                                df.loc[row_index, col_name] = value
-
-                        try:
-                            update_values = [df.columns.values.tolist()] + df.values.tolist()
-                            sheets_service.spreadsheets().values().update(
-                                spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A1",
-                                valueInputOption="USER_ENTERED", body={'values': update_values}
+                        if new_headers_to_add:
+                            sheets_service.spreadsheets().values().append(
+                                spreadsheetId=spreadsheet_id, range=f"{sheet_name}!{chr(65 + original_header_count)}1",
+                                valueInputOption="USER_ENTERED", body={'values': [new_headers_to_add]}
                             ).execute()
+                        
+                        data_to_write = []
+                        for i in range(len(df)):
+                            log_data = update_log.get(i)
+                            if log_data:
+                                row_values = [log_data.get(h, '') for h in log_headers]
+                            else:
+                                row_values = [''] * len(log_headers)
+                            data_to_write.append(row_values)
+                        
+                        if data_to_write:
+                            update_google_sheet_batch(sheets_service, spreadsheet_id, sheet_name, start_row=2, start_col=original_header_count, data_values=data_to_write)
                             st.success("Google Sheet updated successfully!")
                             st.balloons()
-                        except Exception as e:
-                            st.error(f"Failed to update Google Sheet. Error: {e}")
 
             with tab2:
                 st.subheader("Send a Follow-up or Reminder Email")
