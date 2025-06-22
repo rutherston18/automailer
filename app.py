@@ -275,7 +275,7 @@ if gmail_service and sheets_service:
 
             with tab1:
                 st.subheader("Send First-Time Emails")
-                subject_input = st.text_input("Initial Email Subject", value="Following up", key="initial_subject")
+                subject_input = st.text_input("Initial Email Subject", value="Association with Entrepreneurship Cell, IIT Madras || {company}", key="initial_subject")
                 
                 selected_label_name = st.selectbox(
                     "Apply this Gmail label (optional):", 
