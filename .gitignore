@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+venv/
+.env
+
+# PyInstaller
+*.spec
+dist/
+build/
+
+# Sensitive Google Credentials
+# DO NOT UPLOAD THESE TO GITHUB
+token.json
+credentials.json
