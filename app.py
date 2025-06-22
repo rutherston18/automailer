@@ -77,25 +77,73 @@ gmail_service = get_preauthorized_gmail_service()
 
 # Only show the UI if authentication was successful
 if gmail_service:
-    st.header("Prepare and Send Your Campaign")
-    subject_input = st.text_input("Enter Email Subject", "Following up on our conversation")
+    st.header("Step 1: Prepare Your Campaign")
+    subject_input = st.text_input("Enter Email Subject (placeholders like {name} are okay)")
     uploaded_csv = st.file_uploader("Upload Contacts (CSV)", type=["csv"])
     uploaded_template = st.file_uploader("Upload Template (HTML)", type=["html"])
+    
+    st.markdown("---")
 
+    # --- NEW PREVIEW SECTION ---
+    if uploaded_csv is not None and uploaded_template is not None:
+        st.header("Step 2: Preview Your Campaign")
+        
+        try:
+            # Read data for preview
+            df = pd.read_csv(uploaded_csv)
+            html_template = uploaded_template.getvalue().decode("utf-8")
+            
+            st.subheader("CSV Data Preview (First 5 Rows)")
+            st.dataframe(df.head())
+            
+            # Use the first row of data to generate a live preview
+            if not df.empty:
+                st.subheader("Live Email Preview")
+                st.info("This is how the email will look for the first contact in your list.")
+                
+                first_row_data = df.iloc[0].to_dict()
+                
+                # Preview Subject
+                preview_subject = subject_input.format(**first_row_data)
+                st.text_input("Rendered Subject:", preview_subject, disabled=True)
+                
+                # Preview Body
+                preview_html = html_template.format(**first_row_data)
+                with st.container(border=True):
+                    st.markdown(preview_html, unsafe_allow_html=True)
+            else:
+                st.warning("Your CSV file is empty. Cannot generate a preview.")
+
+        except KeyError as e:
+            st.error(f"⚠️ Placeholder Error: The placeholder {e} in your template or subject does not match any column in your CSV file. Please check your files.")
+        except Exception as e:
+            st.error(f"An error occurred while generating the preview: {e}")
+    # --- END OF PREVIEW SECTION ---
+
+    st.markdown("---")
+    
+    # --- SENDING SECTION ---
+    st.header("Step 3: Send Email Campaign")
     if st.button("Send Email Campaign"):
         if not all([uploaded_csv, uploaded_template, subject_input]):
-            st.warning("Please provide a subject, a CSV, and an HTML template.")
+            st.warning("Please provide a subject, a CSV, and an HTML template before sending.")
         else:
             try:
-                df = pd.read_csv(uploaded_csv)
-                html_template = uploaded_template.getvalue().decode("utf-8")
-                total_emails = len(df)
+                # We need to re-read the files in case the user has changed them
+                # since the preview was generated.
+                uploaded_csv.seek(0)
+                df_send = pd.read_csv(uploaded_csv)
+                
+                uploaded_template.seek(0)
+                html_template_send = uploaded_template.getvalue().decode("utf-8")
+
+                total_emails = len(df_send)
                 
                 with st.spinner(f"Sending {total_emails} emails..."):
                     progress_bar = st.progress(0)
                     success_count = 0
                     
-                    for i, row in df.iterrows():
+                    for i, row in df_send.iterrows():
                         row_data = row.to_dict()
                         recipient_email = row_data.get('email')
 
@@ -103,7 +151,7 @@ if gmail_service:
                             st.warning(f"Skipping row {i+2} in CSV: No 'email' column found or value is empty.")
                             continue
                         
-                        result = send_email(gmail_service, recipient_email, subject_input, html_template, row_data)
+                        result = send_email(gmail_service, recipient_email, subject_input, html_template_send, row_data)
                         
                         if result:
                             success_count += 1
@@ -118,4 +166,3 @@ if gmail_service:
                 st.exception(e)
 else:
     st.error("Application is offline. Could not authenticate to Google. Please check the logs or secrets configuration.")
-
