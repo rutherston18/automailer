@@ -1,7 +1,11 @@
 from google_auth_oauthlib.flow import Flow
 
 # This scope must match what's in your app.py
-SCOPES = ["https://www.googleapis.com/auth/gmail.send", "https://www.googleapis.com/auth/spreadsheets"]
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.send", 
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/gmail.readonly"
+]
 
 # Point this to the credentials.json file you downloaded for your "Web application"
 # We are now using the base `Flow` object for more control.
