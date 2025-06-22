@@ -54,7 +54,7 @@ def get_sheet_data(sheets_service, spreadsheet_id):
         first_sheet_name = sheets[0].get("properties", {}).get("title", "Sheet1")
         
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=f"{first_sheet_name}!A:Z" # Read all columns
+            spreadsheetId=spreadsheet_id, range=f"{first_sheet_name}!A:Z"
         ).execute()
         values = result.get('values', [])
         
@@ -64,11 +64,6 @@ def get_sheet_data(sheets_service, spreadsheet_id):
         headers = values[0]
         data = values[1:]
         df = pd.DataFrame(data, columns=headers)
-        # Fill missing columns in data rows with empty strings
-        for col in headers:
-            if col not in df.columns:
-                df[col] = ''
-        df = df[headers] # Ensure column order
         return df, headers, first_sheet_name
     except Exception as e:
         st.error(f"Failed to read Google Sheet. Check link and permissions. Error: {e}")
@@ -79,7 +74,6 @@ def update_google_sheet_batch(sheets_service, spreadsheet_id, sheet_name, start_
     try:
         start_col_letter = chr(65 + start_col)
         range_to_update = f"{sheet_name}!{start_col_letter}{start_row}"
-
         body = {'values': data_values}
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id, range=range_to_update,
@@ -165,86 +159,65 @@ if gmail_service and sheets_service:
                         st.warning("Please provide a subject and an HTML template.")
                     else:
                         html_template = uploaded_template.getvalue().decode("utf-8")
+                        sent_emails_info = []
                         
-                        sent_emails_info = [] # Store info for phase 2
-                        
-                        # --- PHASE 1: SEND ALL EMAILS ---
                         with st.expander("Live Send Status", expanded=True):
                             st.write("--- Phase 1: Sending Emails ---")
                             for i, row in df.iterrows():
-                                row_data = row.to_dict()
-                                email = row_data.get('email')
-                                if not email or pd.isna(email): continue
-                                
-                                st.write(f"Row {i+2}: Sending to **{email}**...")
-                                final_subject = subject_input.format(**row_data)
-                                result = send_initial_email(gmail_service, email, final_subject, html_template, row_data)
-                                
+                                if pd.isna(row.get('email')) or not row.get('email'): continue
+                                st.write(f"Row {i+2}: Sending to **{row.get('email')}**...")
+                                result = send_initial_email(gmail_service, row.get('email'), subject_input, html_template, row.to_dict())
                                 if result:
-                                    sent_emails_info.append({
-                                        "row_index": i,
-                                        "email": email,
-                                        "temp_id": result['id'],
-                                        "thread_id": result['threadId'],
-                                        "subject": final_subject
-                                    })
+                                    sent_emails_info.append({"row_index": i, "temp_id": result['id'], "thread_id": result['threadId'], "subject": subject_input.format(**row.to_dict())})
                                     st.write(f"&nbsp;&nbsp;&nbsp;↳ Success: Email sent (Temp ID: {result['id']}).")
                                 else:
-                                    st.error(f"&nbsp;&nbsp;&nbsp;↳ Failed to send email to {email}.")
+                                    st.error(f"&nbsp;&nbsp;&nbsp;↳ Failed to send email to {row.get('email')}.")
                         
-                        # --- PHASE 2: FETCH MESSAGE IDS ---
-                        update_log = {} # To hold final log data for each row
+                        update_log = {}
                         if sent_emails_info:
                             with st.expander("Live Log Status", expanded=True):
                                 st.write("\n--- Phase 2: Fetching Message IDs (Please Wait) ---")
-                                time.sleep(5) # Wait 5 seconds for emails to process on Google's side
-                                
+                                time.sleep(5)
                                 for sent_item in sent_emails_info:
                                     i = sent_item["row_index"]
-                                    email = sent_item["email"]
-                                    st.write(f"Row {i+2}: Fetching Message-ID for **{email}**...")
+                                    st.write(f"Row {i+2}: Fetching Message-ID for contact...")
                                     msg_id_header = ""
                                     try:
-                                        full_message = gmail_service.users().messages().get(
-                                            userId='me', id=sent_item['temp_id'], format='metadata', metadataHeaders=['Message-ID']
-                                        ).execute()
+                                        full_message = gmail_service.users().messages().get(userId='me', id=sent_item['temp_id'], format='metadata', metadataHeaders=['Message-ID']).execute()
                                         msg_headers = full_message.get('payload', {}).get('headers', [])
                                         msg_id_header = next((h['value'] for h in msg_headers if h['name'] == 'Message-ID'), '')
                                         st.write(f"&nbsp;&nbsp;&nbsp;↳ Success: Message-ID fetched.")
                                     except Exception as e:
-                                        st.warning(f"&nbsp;&nbsp;&nbsp;↳ Warning: Could not fetch Message-ID for {email}. Error: {e}")
+                                        st.warning(f"&nbsp;&nbsp;&nbsp;↳ Warning: Could not fetch Message-ID. Error: {e}")
+                                    update_log[i] = {"Timestamp": datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"), "Status": "Sent", "Subject": sent_item["subject"], "Thread ID": sent_item["thread_id"], "Message ID": msg_id_header}
 
-                                    update_log[i] = {
-                                        "Timestamp": datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"),
-                                        "Status": "Sent",
-                                        "Subject": sent_item["subject"],
-                                        "Thread ID": sent_item["thread_id"],
-                                        "Message ID": msg_id_header
-                                    }
-                        
-                        # --- PHASE 3: UPDATE GOOGLE SHEET IN BATCH ---
                         st.info("--- Phase 3: Updating Google Sheet with logs ---")
+                        original_header_count = len(headers)
                         log_headers = ["Timestamp", "Status", "Subject", "Thread ID", "Message ID"]
-                        for header in log_headers:
-                            if header not in df.columns:
-                                df[header] = '' # Add new columns to the DataFrame
+                        new_headers_to_add = [h for h in log_headers if h not in headers]
                         
-                        # Populate the DataFrame with the new log data
-                        for row_index, log_data in update_log.items():
-                            for col_name, value in log_data.items():
-                                df.loc[row_index, col_name] = value
+                        if new_headers_to_add:
+                            sheets_service.spreadsheets().values().append(
+                                spreadsheetId=spreadsheet_id, range=f"{sheet_name}!{chr(65 + original_header_count)}1",
+                                valueInputOption="USER_ENTERED", body={'values': [new_headers_to_add]}
+                            ).execute()
+                            headers.extend(new_headers_to_add)
 
-                        # Write the entire updated DataFrame back to the sheet
-                        update_values = [df.columns.values.tolist()] + df.values.tolist()
-                        sheets_service.spreadsheets().values().update(
-                            spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A1",
-                            valueInputOption="USER_ENTERED", body={'values': update_values}
-                        ).execute()
-                        st.success("Google Sheet updated successfully!")
+                        data_to_write = []
+                        for i in range(len(df)):
+                            log_data = update_log.get(i)
+                            if log_data:
+                                row_values = [log_data.get(h, '') for h in log_headers]
+                            else:
+                                row_values = [''] * len(log_headers)
+                            data_to_write.append(row_values)
+                        
+                        if data_to_write:
+                            update_google_sheet_batch(sheets_service, spreadsheet_id, sheet_name, start_row=2, start_col=original_header_count, data_values=data_to_write)
+                            st.success("Google Sheet updated successfully!")
                         st.balloons()
 
             with tab2:
-                # ... Reminder tab logic ...
                 st.subheader("Send a Follow-up or Reminder Email")
                 st.info("This will send a threaded reply to contacts who have a 'Message ID' in the sheet.")
                 
@@ -280,3 +253,4 @@ if gmail_service and sheets_service:
                                     st.balloons()
 else:
     st.error("Application is offline. Could not authenticate to Google.")
+
