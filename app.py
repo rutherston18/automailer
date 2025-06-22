@@ -68,8 +68,9 @@ def template_selector_ui(template_type="initial"):
             if selected_template:
                 template_content = load_template(selected_template)
                 if template_content:
-                    with st.expander("Preview Template"):
-                        st.code(template_content[:500] + "..." if len(template_content) > 500 else template_content, language="html")
+                    # --- FIX: Commented out the expander as requested ---
+                    # with st.expander("Preview Template"):
+                    #     st.code(template_content[:500] + "..." if len(template_content) > 500 else template_content, language="html")
                     return template_content
                 else:
                     st.error("Could not load selected template.")
@@ -216,22 +217,18 @@ def send_initial_email(service, to_email, subject, html_body_template, row_data)
 def get_message_id_with_retry(service, gmail_message_id, max_retries=5, base_delay=2):
     """
     Retrieve Message-ID header with exponential backoff retry logic.
-    Gmail API sometimes needs time to process and index sent messages.
     """
     for attempt in range(max_retries):
         try:
-            # Use 'full' format to get complete message data including all headers
             full_message = service.users().messages().get(
                 userId='me', 
                 id=gmail_message_id, 
-                format='full'  # Changed from 'metadata' to 'full'
+                format='full'
             ).execute()
             
-            # Extract headers from the message payload
             payload = full_message.get('payload', {})
             headers = payload.get('headers', [])
             
-            # Look for Message-ID header (case-insensitive)
             message_id = None
             for header in headers:
                 if header.get('name', '').lower() == 'message-id':
@@ -244,7 +241,7 @@ def get_message_id_with_retry(service, gmail_message_id, max_retries=5, base_del
             else:
                 st.write(f"&nbsp;&nbsp;&nbsp;↳ Attempt {attempt + 1}: Message-ID not found in headers")
                 if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    delay = base_delay * (2 ** attempt)
                     st.write(f"&nbsp;&nbsp;&nbsp;↳ Waiting {delay} seconds before retry...")
                     time.sleep(delay)
                     
@@ -291,50 +288,28 @@ def send_reply_email(service, to_email, subject, thread_id, original_msg_id, htm
 
 # --- MAIN STREAMLIT UI ---
 st.set_page_config(layout="wide")
-st.title("📧 Google Sheet Campaign & Reply Tool")
-st.info("This tool uses a Google Sheet for contacts, logs sent emails, and can send threaded replies.")
-
-# Show template management info
-with st.expander("📁 Template Management Info"):
-    templates_dir = Path("templates")
-    if templates_dir.exists():
-        template_files = list(templates_dir.glob("*.html"))
-        if template_files:
-            st.success(f"Found {len(template_files)} saved templates:")
-            for template_file in template_files:
-                st.write(f"- {template_file.stem}")
-        else:
-            st.info("No templates found in the templates folder.")
-    else:
-        st.info("Templates folder will be created automatically when you save your first template.")
-    
-    st.write("**To add templates manually:** Place .html files in the `templates/` folder in your app directory.")
+st.title("CR Mailing Scenes")
+st.info("Put google sheet, template and send off. ")
 
 gmail_service, sheets_service = get_preauthorized_services()
 
 if gmail_service and sheets_service:
-    st.header("Step 1: Link Your Google Sheet")
-    sheet_url = st.text_input("Paste the full URL of your Google Sheet here")
+    st.header("Step 1: Put sheet link")
+    sheet_url = st.text_input("Make sure all the columns are filled!")
 
     if sheet_url:
         try:
             spreadsheet_id = re.search('/d/([a-zA-Z0-9-_]+)', sheet_url).group(1)
-            
-            # Get all sheet names first
             sheet_names = get_all_sheet_names(sheets_service, spreadsheet_id)
             
             if sheet_names:
                 st.success(f"Found {len(sheet_names)} sheet(s) in the workbook")
-                
-                # Let user select which sheet to use
                 selected_sheet = st.selectbox(
                     "Select which sheet to load:",
                     options=sheet_names,
                     index=0,
                     key="sheet_selector"
                 )
-                
-                # Load the selected sheet
                 df, headers, sheet_name = get_sheet_data(sheets_service, spreadsheet_id, selected_sheet)
             else:
                 st.error("No sheets found in the workbook.")
@@ -352,9 +327,12 @@ if gmail_service and sheets_service:
 
             with tab1:
                 st.subheader("Send First-Time Emails")
-                subject_input = st.text_input("Initial Email Subject", key="initial_subject")
+                subject_input = st.text_input(
+                    "Initial Email Subject", 
+                    value="Following up on our conversation",
+                    key="initial_subject"
+                )
                 
-                # Use template selector instead of file uploader
                 html_template = template_selector_ui("initial")
                 
                 if st.button("Start Initial Campaign"):
@@ -395,7 +373,6 @@ if gmail_service and sheets_service:
                                     i = sent_item["row_index"]
                                     st.write(f"Row {i+2}: Fetching Message-ID for {sent_item['email']}...")
                                     
-                                    # Use the improved retry function
                                     msg_id_header = get_message_id_with_retry(
                                         gmail_service, 
                                         sent_item['temp_id']
@@ -416,15 +393,12 @@ if gmail_service and sheets_service:
                             if header not in df.columns:
                                 df[header] = ''  # Add new columns to the DataFrame if they don't exist
                         
-                        # Update the DataFrame in memory with the new log data
                         for row_index, log_data in update_log.items():
                             for col_name, value in log_data.items():
                                 df.loc[row_index, col_name] = value
 
                         try:
-                            # Convert the entire updated DataFrame to a list of lists
                             update_values = [df.columns.values.tolist()] + df.values.tolist()
-                            # Clear the sheet and write the entire updated data back in one go
                             sheets_service.spreadsheets().values().clear(
                                 spreadsheetId=spreadsheet_id, range=selected_sheet
                             ).execute()
@@ -441,7 +415,6 @@ if gmail_service and sheets_service:
                 st.subheader("Send a Follow-up or Reminder Email")
                 st.info("This will send a threaded reply to contacts who have a 'Message ID' in the sheet.")
                 
-                # Use template selector instead of file uploader
                 reminder_template = template_selector_ui("reminder")
 
                 if st.button("Start Reminder Campaign"):
