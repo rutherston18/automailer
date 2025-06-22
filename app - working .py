@@ -45,40 +45,27 @@ def get_preauthorized_services():
         return None, None
 
 # --- DATA & HELPER FUNCTIONS ---
-def get_all_sheet_names(sheets_service, spreadsheet_id):
-    """Returns a list of all sheet names in the spreadsheet."""
+def get_sheet_data(sheets_service, spreadsheet_id):
+    """Reads the first visible sheet and returns its data as a DataFrame."""
     try:
         sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-        sheets = sheet_metadata.get('sheets', [])
-        sheet_names = [sheet.get("properties", {}).get("title", "Sheet1") for sheet in sheets]
-        return sheet_names
-    except Exception as e:
-        st.error(f"Failed to get sheet names. Error: {e}")
-        return []
-
-def get_sheet_data(sheets_service, spreadsheet_id, sheet_name=None):
-    """Reads the specified sheet and returns its data as a DataFrame."""
-    try:
-        if sheet_name is None:
-            # Get the first sheet if no sheet name specified
-            sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-            sheets = sheet_metadata.get('sheets', '')
-            sheet_name = sheets[0].get("properties", {}).get("title", "Sheet1")
+        sheets = sheet_metadata.get('sheets', '')
+        first_sheet_name = sheets[0].get("properties", {}).get("title", "Sheet1")
         
         result = sheets_service.spreadsheets().values().get(
-            spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A:Z"
+            spreadsheetId=spreadsheet_id, range=f"{first_sheet_name}!A:Z"
         ).execute()
         values = result.get('values', [])
         
         if not values:
-            return pd.DataFrame(), [], sheet_name
+            return pd.DataFrame(), [], ""
         
         headers = values[0]
         data = values[1:]
         df = pd.DataFrame(data, columns=headers)
-        return df, headers, sheet_name
+        return df, headers, first_sheet_name
     except Exception as e:
-        st.error(f"Failed to read Google Sheet '{sheet_name}'. Check link and permissions. Error: {e}")
+        st.error(f"Failed to read Google Sheet. Check link and permissions. Error: {e}")
         return pd.DataFrame(), [], ""
 
 # --- IMPROVED EMAIL SENDING FUNCTIONS ---
@@ -190,27 +177,7 @@ if gmail_service and sheets_service:
     if sheet_url:
         try:
             spreadsheet_id = re.search('/d/([a-zA-Z0-9-_]+)', sheet_url).group(1)
-            
-            # Get all sheet names first
-            sheet_names = get_all_sheet_names(sheets_service, spreadsheet_id)
-            
-            if sheet_names:
-                st.success(f"Found {len(sheet_names)} sheet(s) in the workbook")
-                
-                # Let user select which sheet to use
-                selected_sheet = st.selectbox(
-                    "Select which sheet to load:",
-                    options=sheet_names,
-                    index=0,
-                    key="sheet_selector"
-                )
-                
-                # Load the selected sheet
-                df, headers, sheet_name = get_sheet_data(sheets_service, spreadsheet_id, selected_sheet)
-            else:
-                st.error("No sheets found in the workbook.")
-                st.stop()
-                
+            df, headers, sheet_name = get_sheet_data(sheets_service, spreadsheet_id)
         except Exception:
             st.error("Invalid Google Sheet URL. Please paste the full URL from your browser's address bar.")
             st.stop()
