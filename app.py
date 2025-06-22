@@ -6,36 +6,43 @@ from email.message import EmailMessage
 # Google Cloud & Auth Libraries
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# This scope allows the app to send emails on the logged-in user's behalf.
+# This scope must match the one used to generate your original token.json
 SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 
-def get_auth_flow():
+@st.cache_resource
+def get_preauthorized_gmail_service():
     """
-    Creates the OAuth flow object from secrets.
-    This function no longer manages the state.
+    Authenticates using a refresh_token stored in Streamlit Secrets.
+    This bypasses the need for any interactive user login.
     """
     try:
-        client_config = {
-            "web": {
-                "client_id": st.secrets["google_credentials_oauth"]["client_id"],
-                "project_id": st.secrets["google_credentials_oauth"]["project_id"],
-                "auth_uri": st.secrets["google_credentials_oauth"]["auth_uri"],
-                "token_uri": st.secrets["google_credentials_oauth"]["token_uri"],
-                "auth_provider_x509_cert_url": st.secrets["google_credentials_oauth"]["auth_provider_x509_cert_url"],
-                "client_secret": st.secrets["google_credentials_oauth"]["client_secret"],
-                "redirect_uris": st.secrets["google_credentials_oauth"]["redirect_uris"]
-            }
-        }
-        redirect_uri = client_config["web"]["redirect_uris"][0]
-        flow = InstalledAppFlow.from_client_config(client_config, scopes=SCOPES)
-        flow.redirect_uri = redirect_uri
-        return flow
+        # Load all necessary credentials from the single secrets section
+        creds_data = st.secrets["preauthorized_account"]
+        
+        # Create a Credentials object directly from the secrets
+        creds = Credentials.from_authorized_user_info(
+            info={
+                "refresh_token": creds_data["refresh_token"],
+                "client_id": creds_data["client_id"],
+                "client_secret": creds_data["client_secret"],
+                "token_uri": "https://oauth2.googleapis.com/token" # Standard token URI
+            },
+            scopes=SCOPES
+        )
+        
+        # The credentials object will handle refreshing the access token automatically
+        # if it's expired, using the refresh_token.
+        
+        # Build and return the Gmail service object
+        gmail_service = build("gmail", "v1", credentials=creds)
+        st.success("Successfully authenticated with the pre-authorized account.")
+        return gmail_service
+
     except Exception as e:
-        st.error("Your secrets are not configured correctly in Streamlit Cloud.")
+        st.error("Failed to authenticate with the pre-authorized account. Please double-check your Streamlit Secrets.")
         st.exception(e)
         return None
 
@@ -62,18 +69,14 @@ def send_email(service, to_email, subject, html_body_template, row_data):
 
 # --- Main Streamlit UI ---
 st.title("📧 Web-Based Email Campaign Tool")
-st.info("This app sends emails immediately from your logged-in Google account.")
+st.info("This app sends emails immediately from a single, pre-authorized company account.")
+st.markdown("---")
 
-flow = get_auth_flow()
-auth_code = st.query_params.get("code")
+# Authenticate automatically on app load
+gmail_service = get_preauthorized_gmail_service()
 
-# Scenario 1: User is already logged in and authenticated.
-if "google_creds" in st.session_state and st.session_state.google_creds.valid:
-    gmail_service = build("gmail", "v1", credentials=st.session_state.google_creds)
-    user_email = st.session_state.google_creds.id_token.get('email', 'Unknown User')
-    st.success(f"Logged in as: {user_email}")
-    st.markdown("---")
-    
+# Only show the UI if authentication was successful
+if gmail_service:
     st.header("Prepare and Send Your Campaign")
     subject_input = st.text_input("Enter Email Subject", "Following up on our conversation")
     uploaded_csv = st.file_uploader("Upload Contacts (CSV)", type=["csv"])
@@ -87,67 +90,32 @@ if "google_creds" in st.session_state and st.session_state.google_creds.valid:
                 df = pd.read_csv(uploaded_csv)
                 html_template = uploaded_template.getvalue().decode("utf-8")
                 total_emails = len(df)
+                
                 with st.spinner(f"Sending {total_emails} emails..."):
                     progress_bar = st.progress(0)
                     success_count = 0
+                    
                     for i, row in df.iterrows():
                         row_data = row.to_dict()
                         recipient_email = row_data.get('email')
 
-                        if not recipient_email:
+                        if not recipient_email or pd.isna(recipient_email):
                             st.warning(f"Skipping row {i+2} in CSV: No 'email' column found or value is empty.")
                             continue
                         
                         result = send_email(gmail_service, recipient_email, subject_input, html_template, row_data)
+                        
                         if result:
                             success_count += 1
                         
                         progress_bar.progress((i + 1) / total_emails)
+                
                 st.success(f"Finished! Successfully sent {success_count} out of {total_emails} emails.")
                 st.balloons()
+                
             except Exception as e:
                 st.error("An error occurred during file processing or sending.")
                 st.exception(e)
-
-    st.markdown("---")
-    if st.button("Logout"):
-        # Clear all session data on logout
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-        st.rerun()
-
-# Scenario 2: User has returned from Google with an authorization code.
-elif auth_code:
-    if not flow:
-        st.error("Authentication flow is not available. Check secrets configuration.")
-    # Check if the state is present in the session
-    elif 'oauth_state' not in st.session_state:
-        st.error("Login session has expired or been lost. Please try logging in again.")
-    # Check if the returned state matches the saved state
-    elif st.session_state.get("oauth_state") != st.query_params.get("state"):
-        st.error("State mismatch. Cross-site request forgery detected. Authentication failed.")
-    else:
-        # State matches, proceed with fetching the token
-        try:
-            flow.fetch_token(code=auth_code)
-            st.session_state.google_creds = flow.credentials
-            # Clean up URL and state, then rerun to enter the logged-in view
-            st.query_params.clear()
-            del st.session_state["oauth_state"]
-            st.rerun()
-        except Exception as e:
-            st.error(f"Failed to fetch authorization token: {e}")
-
-# Scenario 3: User is not logged in and needs to be shown the login link.
 else:
-    st.header("Step 1: Log in with Google")
-    st.write("You need to authorize this application to send emails on your behalf.")
-    
-    if flow:
-        authorization_url, state = flow.authorization_url(
-            access_type='offline',
-            include_granted_scopes='true'
-        )
-        # Save the state to the session *before* displaying the link
-        st.session_state["oauth_state"] = state
-        st.link_button("Login with Google", authorization_url)
+    st.error("Application is offline. Could not authenticate to Google. Please check the logs or secrets configuration.")
+
