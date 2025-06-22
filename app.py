@@ -3,6 +3,8 @@ import pandas as pd
 import base64
 import re
 import time 
+import os
+from pathlib import Path
 from email.message import EmailMessage
 from datetime import datetime
 import pytz
@@ -19,6 +21,117 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/gmail.readonly"
 ]
+
+# --- TEMPLATE MANAGEMENT FUNCTIONS ---
+def get_available_templates():
+    """Get list of available HTML templates from the templates folder."""
+    templates_dir = Path("templates")
+    if not templates_dir.exists():
+        templates_dir.mkdir(exist_ok=True)
+        return []
+    
+    template_files = list(templates_dir.glob("*.html"))
+    return [f.stem for f in template_files]  # Return names without .html extension
+
+def load_template(template_name):
+    """Load HTML template content from file."""
+    template_path = Path("templates") / f"{template_name}.html"
+    if template_path.exists():
+        return template_path.read_text(encoding='utf-8')
+    return None
+
+def save_template(template_name, html_content):
+    """Save HTML template to file."""
+    templates_dir = Path("templates")
+    templates_dir.mkdir(exist_ok=True)
+    template_path = templates_dir / f"{template_name}.html"
+    template_path.write_text(html_content, encoding='utf-8')
+
+def template_selector_ui(template_type="initial"):
+    """Create UI for template selection with option to use saved or upload new."""
+    available_templates = get_available_templates()
+    
+    if available_templates:
+        template_option = st.radio(
+            f"Choose {template_type} template source:",
+            ["Use saved template", "Upload new template"],
+            key=f"{template_type}_template_option"
+        )
+        
+        if template_option == "Use saved template":
+            selected_template = st.selectbox(
+                "Select template:",
+                available_templates,
+                key=f"{template_type}_template_select"
+            )
+            
+            if selected_template:
+                template_content = load_template(selected_template)
+                if template_content:
+                    with st.expander("Preview Template"):
+                        st.code(template_content[:500] + "..." if len(template_content) > 500 else template_content, language="html")
+                    return template_content
+                else:
+                    st.error("Could not load selected template.")
+                    return None
+        else:
+            # Upload new template
+            uploaded_file = st.file_uploader(
+                f"Upload {template_type} Template (HTML)", 
+                type=["html"], 
+                key=f"{template_type}_upload"
+            )
+            
+            if uploaded_file:
+                template_content = uploaded_file.getvalue().decode("utf-8")
+                
+                # Option to save this template
+                save_option = st.checkbox(f"Save this template for future use", key=f"save_{template_type}")
+                if save_option:
+                    template_name = st.text_input(
+                        "Template name (no spaces):", 
+                        value=uploaded_file.name.replace('.html', '').replace(' ', '_'),
+                        key=f"name_{template_type}"
+                    )
+                    if st.button(f"Save Template", key=f"save_btn_{template_type}"):
+                        if template_name:
+                            save_template(template_name, template_content)
+                            st.success(f"Template '{template_name}' saved successfully!")
+                            st.rerun()  # Refresh to show in saved templates
+                        else:
+                            st.warning("Please enter a template name.")
+                
+                return template_content
+    else:
+        st.info("No saved templates found. Upload your first template below.")
+        uploaded_file = st.file_uploader(
+            f"Upload {template_type} Template (HTML)", 
+            type=["html"], 
+            key=f"{template_type}_upload_first"
+        )
+        
+        if uploaded_file:
+            template_content = uploaded_file.getvalue().decode("utf-8")
+            
+            # Option to save this template
+            save_option = st.checkbox(f"Save this template for future use", key=f"save_first_{template_type}")
+            if save_option:
+                template_name = st.text_input(
+                    "Template name (no spaces):", 
+                    value=uploaded_file.name.replace('.html', '').replace(' ', '_'),
+                    key=f"name_first_{template_type}"
+                )
+                if st.button(f"Save Template", key=f"save_btn_first_{template_type}"):
+                    if template_name:
+                        save_template(template_name, template_content)
+                        st.success(f"Template '{template_name}' saved successfully!")
+                        st.rerun()
+                    else:
+                        st.warning("Please enter a template name.")
+            
+            return template_content
+    
+    return None
 
 # --- AUTHENTICATION & SERVICE SETUP ---
 @st.cache_resource
@@ -181,6 +294,22 @@ st.set_page_config(layout="wide")
 st.title("📧 Google Sheet Campaign & Reply Tool")
 st.info("This tool uses a Google Sheet for contacts, logs sent emails, and can send threaded replies.")
 
+# Show template management info
+with st.expander("📁 Template Management Info"):
+    templates_dir = Path("templates")
+    if templates_dir.exists():
+        template_files = list(templates_dir.glob("*.html"))
+        if template_files:
+            st.success(f"Found {len(template_files)} saved templates:")
+            for template_file in template_files:
+                st.write(f"- {template_file.stem}")
+        else:
+            st.info("No templates found in the templates folder.")
+    else:
+        st.info("Templates folder will be created automatically when you save your first template.")
+    
+    st.write("**To add templates manually:** Place .html files in the `templates/` folder in your app directory.")
+
 gmail_service, sheets_service = get_preauthorized_services()
 
 if gmail_service and sheets_service:
@@ -224,13 +353,14 @@ if gmail_service and sheets_service:
             with tab1:
                 st.subheader("Send First-Time Emails")
                 subject_input = st.text_input("Initial Email Subject", key="initial_subject")
-                uploaded_template = st.file_uploader("Upload Initial Email Template (HTML)", type=["html"], key="initial_template")
+                
+                # Use template selector instead of file uploader
+                html_template = template_selector_ui("initial")
                 
                 if st.button("Start Initial Campaign"):
-                    if not all([uploaded_template, subject_input]):
-                        st.warning("Please provide a subject and an HTML template.")
+                    if not all([html_template, subject_input]):
+                        st.warning("Please provide a subject and select/upload an HTML template.")
                     else:
-                        html_template = uploaded_template.getvalue().decode("utf-8")
                         sent_emails_info = []
                         
                         # --- PHASE 1: SEND ALL EMAILS ---
@@ -296,10 +426,10 @@ if gmail_service and sheets_service:
                             update_values = [df.columns.values.tolist()] + df.values.tolist()
                             # Clear the sheet and write the entire updated data back in one go
                             sheets_service.spreadsheets().values().clear(
-                                spreadsheetId=spreadsheet_id, range=sheet_name
+                                spreadsheetId=spreadsheet_id, range=selected_sheet
                             ).execute()
                             sheets_service.spreadsheets().values().update(
-                                spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A1",
+                                spreadsheetId=spreadsheet_id, range=f"{selected_sheet}!A1",
                                 valueInputOption="USER_ENTERED", body={'values': update_values}
                             ).execute()
                             st.success("Google Sheet updated successfully!")
@@ -311,14 +441,13 @@ if gmail_service and sheets_service:
                 st.subheader("Send a Follow-up or Reminder Email")
                 st.info("This will send a threaded reply to contacts who have a 'Message ID' in the sheet.")
                 
-                uploaded_reminder_template = st.file_uploader("Upload Reminder/Reply Template (HTML)", type=["html"], key="reminder_template")
+                # Use template selector instead of file uploader
+                reminder_template = template_selector_ui("reminder")
 
                 if st.button("Start Reminder Campaign"):
-                    if not uploaded_reminder_template:
-                        st.warning("Please upload a reminder template.")
+                    if not reminder_template:
+                        st.warning("Please select/upload a reminder template.")
                     else:
-                        reminder_template = uploaded_reminder_template.getvalue().decode("utf-8")
-                        
                         if 'Message ID' not in df.columns or 'Thread ID' not in df.columns:
                             st.error("Cannot send reminders. 'Message ID' or 'Thread ID' column not found in the sheet.")
                         else:
