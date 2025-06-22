@@ -12,8 +12,14 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# We need permission to send Gmail AND read/write Sheets.
-SCOPES = ["https://www.googleapis.com/auth/gmail.send", "https://www.googleapis.com/auth/spreadsheets"]
+# --- FIX: ADDED the gmail.readonly SCOPE ---
+# We now need permission to send Gmail, read/write Sheets, AND read email metadata.
+SCOPES = [
+    "https://www.googleapis.com/auth/gmail.send", 
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/gmail.readonly"
+]
+# --- END FIX ---
 
 # --- AUTHENTICATION & SERVICE SETUP ---
 @st.cache_resource
@@ -175,7 +181,6 @@ if gmail_service and sheets_service:
                                 result = send_initial_email(gmail_service, email, final_subject, html_template, row_data)
                                 
                                 if result:
-                                    # --- FIX: Fetch the full Message-ID header for proper threading ---
                                     msg_id_header = ""
                                     try:
                                         full_message = gmail_service.users().messages().get(
@@ -185,14 +190,12 @@ if gmail_service and sheets_service:
                                         msg_id_header = next((h['value'] for h in msg_headers if h['name'] == 'Message-ID'), '')
                                     except Exception as e:
                                         st.warning(f"Could not fetch full Message-ID for {email}: {e}")
-                                    # --- END FIX ---
                                     
-                                    # Update the sheet with log data
                                     update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Timestamp"), datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"))
                                     update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Status"), "Sent")
                                     update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Subject"), final_subject)
                                     update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Thread ID"), result.get('threadId'))
-                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Message ID"), msg_id_header) # <-- Log the correct header
+                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Message ID"), msg_id_header)
                             
                             st.success("Initial campaign sent and logs updated in your Google Sheet!")
                             st.balloons()
