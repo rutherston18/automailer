@@ -1,7 +1,10 @@
 import streamlit as st
 import pandas as pd
 import base64
+import re
 from email.message import EmailMessage
+from datetime import datetime
+import pytz
 
 # Google Cloud & Auth Libraries
 from google.auth.transport.requests import Request
@@ -9,45 +12,72 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-# This scope must match the one used to generate your original token.json
-SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+# We need permission to send Gmail AND read/write Sheets.
+SCOPES = ["https://www.googleapis.com/auth/gmail.send", "https://www.googleapis.com/auth/spreadsheets"]
 
+# --- AUTHENTICATION & SERVICE SETUP (UNCHANGED) ---
 @st.cache_resource
-def get_preauthorized_gmail_service():
-    """
-    Authenticates using a refresh_token stored in Streamlit Secrets.
-    This bypasses the need for any interactive user login.
-    """
+def get_preauthorized_services():
+    """Authenticates and returns service objects for both Gmail and Google Sheets."""
+    gmail_service = None
+    sheets_service = None
     try:
-        # Load all necessary credentials from the single secrets section
         creds_data = st.secrets["preauthorized_account"]
-        
-        # Create a Credentials object directly from the secrets
         creds = Credentials.from_authorized_user_info(
             info={
                 "refresh_token": creds_data["refresh_token"],
                 "client_id": creds_data["client_id"],
                 "client_secret": creds_data["client_secret"],
-                "token_uri": "https://oauth2.googleapis.com/token" # Standard token URI
+                "token_uri": "https://oauth2.googleapis.com/token"
             },
             scopes=SCOPES
         )
-        
-        # The credentials object will handle refreshing the access token automatically
-        # if it's expired, using the refresh_token.
-        
-        # Build and return the Gmail service object
         gmail_service = build("gmail", "v1", credentials=creds)
-        st.success("Successfully authenticated with the pre-authorized account.")
-        return gmail_service
-
+        sheets_service = build("sheets", "v4", credentials=creds)
+        st.success("Successfully authenticated with Google services.")
     except Exception as e:
-        st.error("Failed to authenticate with the pre-authorized account. Please double-check your Streamlit Secrets.")
+        st.error("Failed to authenticate with pre-authorized account. Check secrets/scopes.")
         st.exception(e)
-        return None
+    return gmail_service, sheets_service
 
-def send_email(service, to_email, subject, html_body_template, row_data):
-    """Creates and sends a personalized HTML email."""
+# --- DATA & HELPER FUNCTIONS ---
+def get_sheet_data(sheets_service, spreadsheet_id):
+    """Reads the first visible sheet and returns its data as a DataFrame."""
+    try:
+        sheet_metadata = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+        sheets = sheet_metadata.get('sheets', '')
+        first_sheet_name = sheets[0].get("properties", {}).get("title", "Sheet1")
+        
+        result = sheets_service.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id, range=first_sheet_name
+        ).execute()
+        values = result.get('values', [])
+        
+        if not values:
+            return pd.DataFrame(), [], ""
+        
+        headers = values[0]
+        data = values[1:]
+        return pd.DataFrame(data, columns=headers), headers, first_sheet_name
+    except Exception as e:
+        st.error(f"Failed to read Google Sheet. Check link and permissions. Error: {e}")
+        return pd.DataFrame(), [], ""
+
+def update_google_sheet(sheets_service, spreadsheet_id, sheet_name, row_index, col_index, value):
+    """Updates a single cell in the Google Sheet."""
+    try:
+        range_to_update = f"{sheet_name}!{chr(65 + col_index)}{row_index + 1}"
+        body = {'values': [[value]]}
+        sheets_service.spreadsheets().values().update(
+            spreadsheetId=spreadsheet_id, range=range_to_update,
+            valueInputOption="USER_ENTERED", body=body
+        ).execute()
+    except Exception as e:
+        st.warning(f"Failed to update cell at {range_to_update}. Error: {e}")
+
+# --- EMAIL SENDING FUNCTIONS ---
+def send_initial_email(service, to_email, subject, html_body_template, row_data):
+    """Creates and sends a new personalized HTML email."""
     try:
         final_html_body = html_body_template.format(**row_data)
         final_subject = subject.format(**row_data)
@@ -58,111 +88,132 @@ def send_email(service, to_email, subject, html_body_template, row_data):
         message["Subject"] = final_subject
         encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
         create_message = {"raw": encoded_message}
-        send_message = service.users().messages().send(userId="me", body=create_message).execute()
-        return send_message
-    except HttpError as error:
-        st.error(f"An API error occurred sending to {to_email}: {error}")
-        return None
-    except KeyError as e:
-        st.error(f"Placeholder error for {to_email}: Missing column {e} in your CSV or Subject.")
+        sent_message = service.users().messages().send(userId="me", body=create_message).execute()
+        return sent_message 
+    except Exception as e:
+        st.error(f"An error occurred sending initial email to {to_email}: {e}")
         return None
 
-# --- Main Streamlit UI ---
-st.title("📧 Web-Based Email Campaign Tool")
-st.info("This app sends emails immediately from a single, pre-authorized company account.")
-st.markdown("---")
-
-# Authenticate automatically on app load
-gmail_service = get_preauthorized_gmail_service()
-
-# Only show the UI if authentication was successful
-if gmail_service:
-    st.header("Step 1: Prepare Your Campaign")
-    subject_input = st.text_input("Enter Email Subject (placeholders like {name} are okay)")
-    uploaded_csv = st.file_uploader("Upload Contacts (CSV)", type=["csv"])
-    uploaded_template = st.file_uploader("Upload Template (HTML)", type=["html"])
-    
-    st.markdown("---")
-
-    # --- NEW PREVIEW SECTION ---
-    if uploaded_csv is not None and uploaded_template is not None:
-        st.header("Step 2: Preview Your Campaign")
+def send_reply_email(service, to_email, subject, thread_id, original_msg_id, html_body_template, row_data):
+    """Sends a reply within an existing email thread."""
+    try:
+        final_html_body = html_body_template.format(**row_data)
+        final_subject = f"Re: {subject}" # Standard reply format
         
+        message = EmailMessage()
+        message.add_alternative(final_html_body, subtype='html')
+        message["To"] = to_email
+        message["From"] = "me"
+        message["Subject"] = final_subject
+        # --- These headers make it a reply ---
+        message["In-Reply-To"] = original_msg_id
+        message["References"] = original_msg_id
+        
+        encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+        # --- The threadId ensures it stays in the same conversation ---
+        create_message = {"raw": encoded_message, "threadId": thread_id}
+        
+        sent_message = service.users().messages().send(userId="me", body=create_message).execute()
+        return sent_message
+    except Exception as e:
+        st.error(f"An error occurred sending reply to {to_email}: {e}")
+        return None
+
+# --- MAIN STREAMLIT UI ---
+st.set_page_config(layout="wide")
+st.title("📧 Google Sheet Campaign & Reply Tool")
+st.info("This tool uses a Google Sheet for contacts, logs sent emails, and can send threaded replies.")
+
+gmail_service, sheets_service = get_preauthorized_services()
+
+if gmail_service and sheets_service:
+    st.header("Step 1: Link Your Google Sheet")
+    sheet_url = st.text_input("Paste the full URL of your Google Sheet here")
+
+    if sheet_url:
         try:
-            # Read data for preview
-            df = pd.read_csv(uploaded_csv)
-            html_template = uploaded_template.getvalue().decode("utf-8")
-            
-            st.subheader("CSV Data Preview (First 5 Rows)")
+            spreadsheet_id = re.search('/d/([a-zA-Z0-9-_]+)', sheet_url).group(1)
+            df, headers, sheet_name = get_sheet_data(sheets_service, spreadsheet_id)
+        except Exception:
+            st.error("Invalid Google Sheet URL. Please paste the full URL from your browser's address bar.")
+            st.stop()
+
+        if not df.empty:
+            st.success(f"Successfully loaded {len(df)} rows from sheet: '{sheet_name}'")
             st.dataframe(df.head())
+
+            # --- UI TABS FOR DIFFERENT ACTIONS ---
+            tab1, tab2 = st.tabs(["🚀 Send Initial Campaign", "✉️ Send Reminders / Replies"])
+
+            with tab1:
+                st.subheader("Send First-Time Emails")
+                st.info("This will send an email to every contact in the sheet and log the results back to the sheet.")
+                
+                subject_input = st.text_input("Initial Email Subject", key="initial_subject")
+                uploaded_template = st.file_uploader("Upload Initial Email Template (HTML)", type=["html"], key="initial_template")
+                
+                if st.button("Start Initial Campaign"):
+                    if not all([uploaded_template, subject_input]):
+                        st.warning("Please provide a subject and an HTML template.")
+                    else:
+                        html_template = uploaded_template.getvalue().decode("utf-8")
+                        with st.spinner(f"Sending initial emails to {len(df)} contacts..."):
+                            for i, row in df.iterrows():
+                                row_data = row.to_dict()
+                                email = row_data.get('email')
+                                if not email or pd.isna(email):
+                                    continue
+                                
+                                result = send_initial_email(gmail_service, email, subject_input, html_template, row_data)
+                                if result:
+                                    # Update the sheet with log data
+                                    if "Timestamp" not in headers: headers.append("Timestamp")
+                                    if "Status" not in headers: headers.append("Status")
+                                    if "Thread ID" not in headers: headers.append("Thread ID")
+                                    if "Message ID" not in headers: headers.append("Message ID")
+                                    
+                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Timestamp"), datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"))
+                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Status"), "Sent")
+                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Thread ID"), result.get('threadId'))
+                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Message ID"), result.get('id'))
+                            st.success("Initial campaign sent and logs updated in your Google Sheet!")
+                            st.balloons()
             
-            # Use the first row of data to generate a live preview
-            if not df.empty:
-                st.subheader("Live Email Preview")
-                st.info("This is how the email will look for the first contact in your list.")
+            with tab2:
+                st.subheader("Send a Follow-up or Reminder Email")
+                st.info("This will send a threaded reply to contacts who have a 'Thread ID' in the sheet.")
                 
-                first_row_data = df.iloc[0].to_dict()
-                
-                # Preview Subject
-                preview_subject = subject_input.format(**first_row_data)
-                st.text_input("Rendered Subject:", preview_subject, disabled=True)
-                
-                # Preview Body
-                preview_html = html_template.format(**first_row_data)
-                with st.container(border=True):
-                    st.markdown(preview_html, unsafe_allow_html=True)
-            else:
-                st.warning("Your CSV file is empty. Cannot generate a preview.")
+                reminder_subject = st.text_input("Original Subject Line (for context)", key="reminder_subject", help="Enter the original subject to filter, or leave blank to target all.")
+                uploaded_reminder_template = st.file_uploader("Upload Reminder/Reply Template (HTML)", type=["html"], key="reminder_template")
 
-        except KeyError as e:
-            st.error(f"⚠️ Placeholder Error: The placeholder {e} in your template or subject does not match any column in your CSV file. Please check your files.")
-        except Exception as e:
-            st.error(f"An error occurred while generating the preview: {e}")
-    # --- END OF PREVIEW SECTION ---
-
-    st.markdown("---")
-    
-    # --- SENDING SECTION ---
-    st.header("Step 3: Send Email Campaign")
-    if st.button("Send Email Campaign"):
-        if not all([uploaded_csv, uploaded_template, subject_input]):
-            st.warning("Please provide a subject, a CSV, and an HTML template before sending.")
-        else:
-            try:
-                # We need to re-read the files in case the user has changed them
-                # since the preview was generated.
-                uploaded_csv.seek(0)
-                df_send = pd.read_csv(uploaded_csv)
-                
-                uploaded_template.seek(0)
-                html_template_send = uploaded_template.getvalue().decode("utf-8")
-
-                total_emails = len(df_send)
-                
-                with st.spinner(f"Sending {total_emails} emails..."):
-                    progress_bar = st.progress(0)
-                    success_count = 0
-                    
-                    for i, row in df_send.iterrows():
-                        row_data = row.to_dict()
-                        recipient_email = row_data.get('email')
-
-                        if not recipient_email or pd.isna(recipient_email):
-                            st.warning(f"Skipping row {i+2} in CSV: No 'email' column found or value is empty.")
-                            continue
+                if st.button("Start Reminder Campaign"):
+                    if not uploaded_reminder_template:
+                        st.warning("Please upload a reminder template.")
+                    else:
+                        reminder_template = uploaded_reminder_template.getvalue().decode("utf-8")
+                        # Filter for contacts that have been successfully emailed before
+                        reply_df = df[df['Thread ID'].notna() & (df['Thread ID'] != '')]
                         
-                        result = send_email(gmail_service, recipient_email, subject_input, html_template_send, row_data)
-                        
-                        if result:
-                            success_count += 1
-                        
-                        progress_bar.progress((i + 1) / total_emails)
-                
-                st.success(f"Finished! Successfully sent {success_count} out of {total_emails} emails.")
-                st.balloons()
-                
-            except Exception as e:
-                st.error("An error occurred during file processing or sending.")
-                st.exception(e)
+                        if reminder_subject: # Optional filtering by subject
+                            reply_df = reply_df[reply_df['Subject'] == reminder_subject]
+
+                        if reply_df.empty:
+                            st.warning("No contacts found with a Thread ID to reply to. Please run an initial campaign first.")
+                        else:
+                            with st.spinner(f"Sending reminders to {len(reply_df)} contacts..."):
+                                for i, row in reply_df.iterrows():
+                                    row_data = row.to_dict()
+                                    send_reply_email(
+                                        gmail_service,
+                                        row_data.get('email'),
+                                        row_data.get('Subject'), # The original subject
+                                        row_data.get('Thread ID'),
+                                        row_data.get('Message ID'),
+                                        reminder_template,
+                                        row_data
+                                    )
+                                st.success("Reminder campaign sent!")
+                                st.balloons()
 else:
-    st.error("Application is offline. Could not authenticate to Google. Please check the logs or secrets configuration.")
+    st.error("Application is offline. Could not authenticate to Google.")
+
