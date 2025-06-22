@@ -150,7 +150,8 @@ if gmail_service and sheets_service:
                             for i, row in df.iterrows():
                                 if pd.isna(row.get('email')) or not row.get('email'): continue
                                 st.write(f"Row {i+2}: Sending to **{row.get('email')}**...")
-                                result = send_initial_email(gmail_service, row.get('email'), subject_input, row.to_dict())
+                                # --- FIX: Corrected the arguments passed to the function ---
+                                result = send_initial_email(gmail_service, row.get('email'), subject_input, html_template, row.to_dict())
                                 if result:
                                     sent_emails_info.append({"row_index": i, "temp_id": result['id'], "thread_id": result['threadId'], "subject": subject_input.format(**row.to_dict())})
                                     st.write(f"&nbsp;&nbsp;&nbsp;↳ Success: Email sent (Temp ID: {result['id']}).")
