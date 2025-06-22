@@ -68,7 +68,7 @@ def get_sheet_data(sheets_service, spreadsheet_id):
         st.error(f"Failed to read Google Sheet. Check link and permissions. Error: {e}")
         return pd.DataFrame(), [], ""
 
-# --- EMAIL SENDING FUNCTIONS ---
+# --- IMPROVED EMAIL SENDING FUNCTIONS ---
 def send_initial_email(service, to_email, subject, html_body_template, row_data):
     """Creates and sends a new personalized HTML email."""
     try:
@@ -86,6 +86,62 @@ def send_initial_email(service, to_email, subject, html_body_template, row_data)
     except Exception as e:
         st.error(f"An error occurred sending initial email to {to_email}: {e}")
         return None
+
+def get_message_id_with_retry(service, gmail_message_id, max_retries=5, base_delay=2):
+    """
+    Retrieve Message-ID header with exponential backoff retry logic.
+    Gmail API sometimes needs time to process and index sent messages.
+    """
+    for attempt in range(max_retries):
+        try:
+            # Use 'full' format to get complete message data including all headers
+            full_message = service.users().messages().get(
+                userId='me', 
+                id=gmail_message_id, 
+                format='full'  # Changed from 'metadata' to 'full'
+            ).execute()
+            
+            # Extract headers from the message payload
+            payload = full_message.get('payload', {})
+            headers = payload.get('headers', [])
+            
+            # Look for Message-ID header (case-insensitive)
+            message_id = None
+            for header in headers:
+                if header.get('name', '').lower() == 'message-id':
+                    message_id = header.get('value', '')
+                    break
+            
+            if message_id:
+                st.write(f"&nbsp;&nbsp;&nbsp;↳ Success: Found Message-ID: `{message_id}`")
+                return message_id
+            else:
+                st.write(f"&nbsp;&nbsp;&nbsp;↳ Attempt {attempt + 1}: Message-ID not found in headers")
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    st.write(f"&nbsp;&nbsp;&nbsp;↳ Waiting {delay} seconds before retry...")
+                    time.sleep(delay)
+                    
+        except HttpError as e:
+            if e.resp.status == 404:
+                st.write(f"&nbsp;&nbsp;&nbsp;↳ Attempt {attempt + 1}: Message not found (404)")
+            else:
+                st.write(f"&nbsp;&nbsp;&nbsp;↳ Attempt {attempt + 1}: HTTP Error {e.resp.status}")
+            
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                st.write(f"&nbsp;&nbsp;&nbsp;↳ Waiting {delay} seconds before retry...")
+                time.sleep(delay)
+                
+        except Exception as e:
+            st.write(f"&nbsp;&nbsp;&nbsp;↳ Attempt {attempt + 1}: Unexpected error: {str(e)}")
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                st.write(f"&nbsp;&nbsp;&nbsp;↳ Waiting {delay} seconds before retry...")
+                time.sleep(delay)
+    
+    st.warning("&nbsp;&nbsp;&nbsp;↳ Warning: Could not retrieve Message-ID after all retries")
+    return ""
 
 def send_reply_email(service, to_email, subject, thread_id, original_msg_id, html_body_template, row_data):
     """Sends a reply within an existing email thread."""
@@ -148,40 +204,54 @@ if gmail_service and sheets_service:
                         with st.expander("Live Send Status", expanded=True):
                             st.write("--- Phase 1: Sending Emails ---")
                             for i, row in df.iterrows():
-                                if pd.isna(row.get('email')) or not row.get('email'): continue
+                                if pd.isna(row.get('email')) or not row.get('email'): 
+                                    continue
                                 st.write(f"Row {i+2}: Sending to **{row.get('email')}**...")
                                 result = send_initial_email(gmail_service, row.get('email'), subject_input, html_template, row.to_dict())
                                 if result:
-                                    sent_emails_info.append({"row_index": i, "temp_id": result['id'], "thread_id": result['threadId'], "subject": subject_input.format(**row.to_dict())})
-                                    st.write(f"&nbsp;&nbsp;&nbsp;↳ Success: Email sent (Temp ID: {result['id']}).")
+                                    sent_emails_info.append({
+                                        "row_index": i, 
+                                        "temp_id": result['id'], 
+                                        "thread_id": result['threadId'], 
+                                        "subject": subject_input.format(**row.to_dict()),
+                                        "email": row.get('email')
+                                    })
+                                    st.write(f"&nbsp;&nbsp;&nbsp;↳ Success: Email sent (Gmail ID: {result['id']}).")
                                 else:
                                     st.error(f"&nbsp;&nbsp;&nbsp;↳ Failed to send email to {row.get('email')}.")
                         
-                        # --- PHASE 2: WAIT & FETCH MESSAGE IDS ---
+                        # --- PHASE 2: WAIT & FETCH MESSAGE IDS WITH IMPROVED RETRY LOGIC ---
                         update_log = {}
                         if sent_emails_info:
                             with st.expander("Live Log Status", expanded=True):
-                                st.write("\n--- Phase 2: Fetching Message IDs (Please Wait) ---")
-                                time.sleep(5) # Deliberate pause for Google's servers
+                                st.write("\n--- Phase 2: Fetching Message IDs with Retry Logic ---")
+                                st.write("⏳ Waiting 10 seconds for Gmail to process sent messages...")
+                                time.sleep(10)  # Increased initial wait time
+                                
                                 for sent_item in sent_emails_info:
                                     i = sent_item["row_index"]
-                                    st.write(f"Row {i+2}: Fetching Message-ID for contact...")
-                                    msg_id_header = ""
-                                    try:
-                                        full_message = gmail_service.users().messages().get(userId='me', id=sent_item['temp_id'], format='metadata', metadataHeaders=['Message-ID']).execute()
-                                        msg_headers = full_message.get('payload', {}).get('headers', [])
-                                        msg_id_header = next((h['value'] for h in msg_headers if h['name'] == 'Message-ID'), '')
-                                        st.write(f"&nbsp;&nbsp;&nbsp;↳ Success: Fetched Message-ID: `{msg_id_header}`")
-                                    except Exception as e:
-                                        st.warning(f"&nbsp;&nbsp;&nbsp;↳ Warning: Could not fetch Message-ID. Error: {e}")
-                                    update_log[i] = {"Timestamp": datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"), "Status": "Sent", "Subject": sent_item["subject"], "Thread ID": sent_item["thread_id"], "Message ID": msg_id_header}
+                                    st.write(f"Row {i+2}: Fetching Message-ID for {sent_item['email']}...")
+                                    
+                                    # Use the improved retry function
+                                    msg_id_header = get_message_id_with_retry(
+                                        gmail_service, 
+                                        sent_item['temp_id']
+                                    )
+                                    
+                                    update_log[i] = {
+                                        "Timestamp": datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"), 
+                                        "Status": "Sent", 
+                                        "Subject": sent_item["subject"], 
+                                        "Thread ID": sent_item["thread_id"], 
+                                        "Message ID": msg_id_header
+                                    }
                         
                         # --- PHASE 3: UPDATE GOOGLE SHEET RELIABLY ---
                         st.info("--- Phase 3: Updating Google Sheet with logs ---")
                         log_headers = ["Timestamp", "Status", "Subject", "Thread ID", "Message ID"]
                         for header in log_headers:
                             if header not in df.columns:
-                                df[header] = '' # Add new columns to the DataFrame if they don't exist
+                                df[header] = ''  # Add new columns to the DataFrame if they don't exist
                         
                         # Update the DataFrame in memory with the new log data
                         for row_index, log_data in update_log.items():
