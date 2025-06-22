@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import base64
 import re
-import time # <-- IMPORT THE TIME MODULE
+import time 
 from email.message import EmailMessage
 from datetime import datetime
 import pytz
@@ -63,23 +63,27 @@ def get_sheet_data(sheets_service, spreadsheet_id):
         
         headers = values[0]
         data = values[1:]
+        # Pad rows with empty strings to match header length
+        data = [row + [''] * (len(headers) - len(row)) for row in data]
         return pd.DataFrame(data, columns=headers), headers, first_sheet_name
     except Exception as e:
         st.error(f"Failed to read Google Sheet. Check link and permissions. Error: {e}")
         return pd.DataFrame(), [], ""
 
-def update_google_sheet(sheets_service, spreadsheet_id, sheet_name, row_index, col_index, value):
-    """Updates a single cell in the Google Sheet."""
+def update_google_sheet_batch(sheets_service, spreadsheet_id, sheet_name, start_row, start_col, data_values):
+    """Updates a range of cells in the Google Sheet in one batch call."""
     try:
-        column_letter = chr(65 + col_index)
-        range_to_update = f"{sheet_name}!{column_letter}{row_index + 2}" # +2 because of 0-indexing and header row
-        body = {'values': [[value]]}
+        start_col_letter = chr(65 + start_col)
+        end_col_letter = chr(65 + start_col + len(data_values[0]) - 1)
+        range_to_update = f"{sheet_name}!{start_col_letter}{start_row}:{end_col_letter}{start_row + len(data_values) - 1}"
+
+        body = {'values': data_values}
         sheets_service.spreadsheets().values().update(
             spreadsheetId=spreadsheet_id, range=range_to_update,
             valueInputOption="USER_ENTERED", body=body
         ).execute()
     except Exception as e:
-        st.warning(f"Failed to update cell at {range_to_update}. Error: {e}")
+        st.warning(f"Failed to perform batch update on sheet. Error: {e}")
 
 # --- EMAIL SENDING FUNCTIONS ---
 def send_initial_email(service, to_email, subject, html_body_template, row_data):
@@ -160,59 +164,110 @@ if gmail_service and sheets_service:
                         st.warning("Please provide a subject and an HTML template.")
                     else:
                         html_template = uploaded_template.getvalue().decode("utf-8")
-                        with st.spinner(f"Sending initial emails to {len(df)} contacts..."):
-                            log_headers = ["Timestamp", "Status", "Subject", "Thread ID", "Message ID"]
-                            # Check if headers need to be added to the sheet
-                            new_headers_to_add = [h for h in log_headers if h not in headers]
-                            if new_headers_to_add:
-                                updated_headers = headers + new_headers_to_add
-                                sheets_service.spreadsheets().values().update(
-                                    spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A1",
-                                    valueInputOption="USER_ENTERED", body={'values': [updated_headers]}
-                                ).execute()
-                                headers = updated_headers # Update local headers list
-
+                        
+                        log_headers = ["Timestamp", "Status", "Subject", "Thread ID", "Message ID"]
+                        original_header_count = len(headers)
+                        new_headers_to_add = [h for h in log_headers if h not in headers]
+                        
+                        if new_headers_to_add:
+                            headers.extend(new_headers_to_add)
+                            sheets_service.spreadsheets().values().update(
+                                spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A1",
+                                valueInputOption="USER_ENTERED", body={'values': [headers]}
+                            ).execute()
+                        
+                        update_data_values = []
+                        
+                        with st.expander("Live Send Status", expanded=True):
                             for i, row in df.iterrows():
                                 row_data = row.to_dict()
                                 email = row_data.get('email')
-                                if not email or pd.isna(email): continue
+                                if not email or pd.isna(email): 
+                                    st.write(f"_Row {i+2}: Skipping, no email address._")
+                                    continue
                                 
+                                st.write(f"Row {i+2}: Sending to **{email}**...")
                                 final_subject = subject_input.format(**row_data)
                                 result = send_initial_email(gmail_service, email, final_subject, html_template, row_data)
                                 
+                                row_update_values = [''] * len(log_headers)
+
                                 if result:
                                     msg_id_header = ""
-                                    # --- FIX: ADDED RETRY LOGIC ---
-                                    for attempt in range(3): # Retry up to 3 times
+                                    for attempt in range(4): 
                                         try:
+                                            time.sleep(0.5 + attempt * 0.5) 
                                             full_message = gmail_service.users().messages().get(
                                                 userId='me', id=result['id'], format='metadata', metadataHeaders=['Message-ID']
                                             ).execute()
                                             msg_headers = full_message.get('payload', {}).get('headers', [])
                                             msg_id_header = next((h['value'] for h in msg_headers if h['name'] == 'Message-ID'), '')
-                                            if msg_id_header: # If we successfully got the ID, stop retrying
+                                            if msg_id_header:
+                                                st.write(f"&nbsp;&nbsp;&nbsp;↳ Success: Message-ID fetched.")
                                                 break
-                                        except Exception as e:
-                                            # If it's the last attempt, log the warning
-                                            if attempt == 2:
-                                                st.warning(f"Could not fetch full Message-ID for {email} after 3 attempts: {e}")
-                                        time.sleep(1) # Wait 1 second before the next attempt
-                                    # --- END FIX ---
+                                        except Exception:
+                                            if attempt == 3:
+                                                st.warning(f"&nbsp;&nbsp;&nbsp;↳ Warning: Could not fetch Message-ID for {email} after several attempts.")
                                     
-                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i, headers.index("Timestamp"), datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"))
-                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i, headers.index("Status"), "Sent")
-                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i, headers.index("Subject"), final_subject)
-                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i, headers.index("Thread ID"), result.get('threadId'))
-                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i, headers.index("Message ID"), msg_id_header)
-                            
-                            st.success("Initial campaign sent and logs updated in your Google Sheet!")
-                            st.balloons()
+                                    row_update_values = [
+                                        datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"),
+                                        "Sent",
+                                        final_subject,
+                                        result.get('threadId', ''),
+                                        msg_id_header
+                                    ]
+                                else:
+                                    st.error(f"&nbsp;&nbsp;&nbsp;↳ Failed to send email to {email}.")
+                                    row_update_values[1] = "Failed"
+                                
+                                update_data_values.append(row_update_values)
+                        
+                        if update_data_values:
+                            st.info("Updating Google Sheet with logs...")
+                            update_google_sheet_batch(
+                                sheets_service, spreadsheet_id, sheet_name, 
+                                start_row=2,
+                                start_col=original_header_count,
+                                data_values=update_data_values
+                            )
+                            st.success("Google Sheet updated!")
+                        st.balloons()
             
             with tab2:
-                # ... (Reminder tab logic remains the same) ...
+                # --- FIX: RESTORED REMINDER UI AND LOGIC ---
                 st.subheader("Send a Follow-up or Reminder Email")
-                # (The rest of this tab is unchanged and will now work correctly
-                # because the Message ID will be properly logged)
+                st.info("This will send a threaded reply to contacts who have a 'Message ID' in the sheet.")
+                
+                uploaded_reminder_template = st.file_uploader("Upload Reminder/Reply Template (HTML)", type=["html"], key="reminder_template")
 
+                if st.button("Start Reminder Campaign"):
+                    if not uploaded_reminder_template:
+                        st.warning("Please upload a reminder template.")
+                    else:
+                        reminder_template = uploaded_reminder_template.getvalue().decode("utf-8")
+                        
+                        # Check if required columns exist before trying to filter
+                        if 'Message ID' not in df.columns or 'Thread ID' not in df.columns:
+                            st.error("Cannot send reminders. 'Message ID' or 'Thread ID' column not found in the sheet.")
+                        else:
+                            reply_df = df[df['Message ID'].notna() & (df['Message ID'] != '')].copy()
+
+                            if reply_df.empty:
+                                st.warning("No contacts found with a valid 'Message ID' to reply to. Please run an initial campaign first.")
+                            else:
+                                with st.spinner(f"Sending reminders to {len(reply_df)} contacts..."):
+                                    for i, row in reply_df.iterrows():
+                                        row_data = row.to_dict()
+                                        send_reply_email(
+                                            gmail_service,
+                                            row_data.get('email'),
+                                            row_data.get('Subject'),
+                                            row_data.get('Thread ID'),
+                                            row_data.get('Message ID'),
+                                            reminder_template,
+                                            row_data
+                                        )
+                                    st.success("Reminder campaign sent!")
+                                    st.balloons()
 else:
     st.error("Application is offline. Could not authenticate to Google.")
