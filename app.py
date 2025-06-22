@@ -14,7 +14,10 @@ from googleapiclient.errors import HttpError
 SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 
 def get_auth_flow():
-    """Creates the OAuth flow object from secrets."""
+    """
+    Creates the OAuth flow object from secrets.
+    This function no longer manages the state.
+    """
     try:
         client_config = {
             "web": {
@@ -28,11 +31,7 @@ def get_auth_flow():
             }
         }
         redirect_uri = client_config["web"]["redirect_uris"][0]
-        # Make sure state is stored in the session before creating the flow
-        if 'oauth_state' not in st.session_state:
-            st.session_state['oauth_state'] = None
-            
-        flow = InstalledAppFlow.from_client_config(client_config, scopes=SCOPES, state=st.session_state['oauth_state'])
+        flow = InstalledAppFlow.from_client_config(client_config, scopes=SCOPES)
         flow.redirect_uri = redirect_uri
         return flow
     except Exception as e:
@@ -65,13 +64,10 @@ def send_email(service, to_email, subject, html_body_template, row_data):
 st.title("📧 Web-Based Email Campaign Tool")
 st.info("This app sends emails immediately from your logged-in Google account.")
 
-# Get the authentication flow object
 flow = get_auth_flow()
-
-# Check for the authorization code in the URL query params
 auth_code = st.query_params.get("code")
 
-# If the user is logged in, show the main app
+# Scenario 1: User is already logged in and authenticated.
 if "google_creds" in st.session_state and st.session_state.google_creds.valid:
     gmail_service = build("gmail", "v1", credentials=st.session_state.google_creds)
     user_email = st.session_state.google_creds.id_token.get('email', 'Unknown User')
@@ -84,36 +80,65 @@ if "google_creds" in st.session_state and st.session_state.google_creds.valid:
     uploaded_template = st.file_uploader("Upload Template (HTML)", type=["html"])
 
     if st.button("Send Email Campaign"):
-        # Sending logic here... (omitted for brevity, remains the same)
-        st.success("Campaign Sent!")
+        if not all([uploaded_csv, uploaded_template, subject_input]):
+            st.warning("Please provide a subject, a CSV, and an HTML template.")
+        else:
+            try:
+                df = pd.read_csv(uploaded_csv)
+                html_template = uploaded_template.getvalue().decode("utf-8")
+                total_emails = len(df)
+                with st.spinner(f"Sending {total_emails} emails..."):
+                    progress_bar = st.progress(0)
+                    success_count = 0
+                    for i, row in df.iterrows():
+                        row_data = row.to_dict()
+                        recipient_email = row_data.get('email')
+
+                        if not recipient_email:
+                            st.warning(f"Skipping row {i+2} in CSV: No 'email' column found or value is empty.")
+                            continue
+                        
+                        result = send_email(gmail_service, recipient_email, subject_input, html_template, row_data)
+                        if result:
+                            success_count += 1
+                        
+                        progress_bar.progress((i + 1) / total_emails)
+                st.success(f"Finished! Successfully sent {success_count} out of {total_emails} emails.")
+                st.balloons()
+            except Exception as e:
+                st.error("An error occurred during file processing or sending.")
+                st.exception(e)
 
     st.markdown("---")
     if st.button("Logout"):
-        del st.session_state.google_creds
-        if "oauth_state" in st.session_state:
-            del st.session_state["oauth_state"]
+        # Clear all session data on logout
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
         st.rerun()
 
-# If there is an auth code in the URL, handle the token exchange
+# Scenario 2: User has returned from Google with an authorization code.
 elif auth_code:
-    if flow:
-        # Check for state mismatch
-        if st.session_state.get("oauth_state") != st.query_params.get("state"):
-            st.error("State mismatch. Authentication failed. Please try logging in again.")
-        else:
-            try:
-                # Exchange the code for credentials
-                flow.fetch_token(code=auth_code)
-                # Save credentials in the session state
-                st.session_state.google_creds = flow.credentials
-                # Clean up URL and rerun the app
-                st.query_params.clear()
-                del st.session_state["oauth_state"]
-                st.rerun()
-            except Exception as e:
-                st.error(f"Failed to fetch authorization token: {e}")
+    if not flow:
+        st.error("Authentication flow is not available. Check secrets configuration.")
+    # Check if the state is present in the session
+    elif 'oauth_state' not in st.session_state:
+        st.error("Login session has expired or been lost. Please try logging in again.")
+    # Check if the returned state matches the saved state
+    elif st.session_state.get("oauth_state") != st.query_params.get("state"):
+        st.error("State mismatch. Cross-site request forgery detected. Authentication failed.")
+    else:
+        # State matches, proceed with fetching the token
+        try:
+            flow.fetch_token(code=auth_code)
+            st.session_state.google_creds = flow.credentials
+            # Clean up URL and state, then rerun to enter the logged-in view
+            st.query_params.clear()
+            del st.session_state["oauth_state"]
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to fetch authorization token: {e}")
 
-# If the user is not logged in and there's no auth code, show the login button
+# Scenario 3: User is not logged in and needs to be shown the login link.
 else:
     st.header("Step 1: Log in with Google")
     st.write("You need to authorize this application to send emails on your behalf.")
@@ -123,6 +148,6 @@ else:
             access_type='offline',
             include_granted_scopes='true'
         )
-        # Store the state *before* displaying the link
+        # Save the state to the session *before* displaying the link
         st.session_state["oauth_state"] = state
         st.link_button("Login with Google", authorization_url)
