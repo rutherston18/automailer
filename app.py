@@ -329,7 +329,7 @@ if gmail_service and sheets_service:
                 st.subheader("Send First-Time Emails")
                 subject_input = st.text_input(
                     "Initial Email Subject", 
-                    value="Following up on our conversation",
+                    value="Association with Entrepreneurship Cell, IIT Madras || {company}",
                     key="initial_subject"
                 )
                 
