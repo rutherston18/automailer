@@ -13,18 +13,8 @@ from googleapiclient.errors import HttpError
 # This scope allows the app to send emails on the logged-in user's behalf.
 SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 
-def authenticate_gmail():
-    """
-    Handles Google Authentication for a web-based Streamlit app using the
-    correct authorization code flow, which is required for cloud environments.
-    """
-    creds_key = "google_creds"
-    
-    # If we already have valid credentials in the session, build and return the service
-    if creds_key in st.session_state and st.session_state[creds_key].valid:
-        return build("gmail", "v1", credentials=st.session_state[creds_key])
-
-    # --- Step 1: Get client configuration from secrets ---
+def get_auth_flow():
+    """Creates the OAuth flow object from secrets."""
     try:
         client_config = {
             "web": {
@@ -37,75 +27,45 @@ def authenticate_gmail():
                 "redirect_uris": st.secrets["google_credentials_oauth"]["redirect_uris"]
             }
         }
-        # The first URI in your list is used as the redirect URI.
-        # This MUST be the URL of your deployed Streamlit app.
-        # It must also be listed in the "Authorized redirect URIs" in your Google Cloud Console.
         redirect_uri = client_config["web"]["redirect_uris"][0]
-        
+        flow = InstalledAppFlow.from_client_config(client_config, scopes=SCOPES)
+        flow.redirect_uri = redirect_uri
+        return flow
     except Exception as e:
         st.error("Your secrets are not configured correctly in Streamlit Cloud.")
         st.exception(e)
         return None
 
-    # --- Step 2: Handle the return from Google with the authorization code ---
-    if "code" in st.query_params:
-        # User has returned from Google's login page with a code.
-        
-        # Verify the state to prevent CSRF attacks
+def handle_oauth_callback(flow):
+    """Handles the user's return from Google with an authorization code."""
+    code = st.query_params.get("code")
+    if code:
         if st.session_state.get("oauth_state") != st.query_params.get("state"):
             st.error("State mismatch. Authentication failed. Please try logging in again.")
-            return None
+            return
         
         try:
-            flow = InstalledAppFlow.from_client_config(client_config, scopes=SCOPES, state=st.session_state["oauth_state"])
-            flow.redirect_uri = redirect_uri
-            
-            # Use the authorization code to fetch the token
-            flow.fetch_token(code=st.query_params["code"])
-            
-            st.session_state[creds_key] = flow.credentials
-            
-            # Clean up URL and state, then rerun the script for a clean UI
-            del st.session_state["oauth_state"]
+            flow.fetch_token(code=code)
+            st.session_state.google_creds = flow.credentials
+            # Clear URL params and state, then rerun
             st.query_params.clear()
+            del st.session_state["oauth_state"]
             st.rerun()
-
         except Exception as e:
-            st.error("Failed to fetch authorization token.")
-            st.exception(e)
-            return None
-            
-    else:
-        # --- Step 3: If no code, start the authorization flow by generating a login link ---
-        flow = InstalledAppFlow.from_client_config(client_config, scopes=SCOPES)
-        flow.redirect_uri = redirect_uri
-
-        authorization_url, state = flow.authorization_url(
-            access_type='offline',
-            include_granted_scopes='true'
-        )
-        
-        # Store state in session to verify after redirect
-        st.session_state["oauth_state"] = state
-        
-        return None # Indicate that the login process is not complete
-
+            st.error(f"Failed to fetch authorization token: {e}")
+    
 def send_email(service, to_email, subject, html_body_template, row_data):
     """Creates and sends a personalized HTML email."""
     try:
         final_html_body = html_body_template.format(**row_data)
         final_subject = subject.format(**row_data)
-
         message = EmailMessage()
         message.add_alternative(final_html_body, subtype='html')
-        
         message["To"] = to_email
         message["From"] = "me"
         message["Subject"] = final_subject
-
         encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
         create_message = {"raw": encoded_message}
-        
         send_message = service.users().messages().send(userId="me", body=create_message).execute()
         return send_message
     except HttpError as error:
@@ -119,11 +79,18 @@ def send_email(service, to_email, subject, html_body_template, row_data):
 st.title("📧 Web-Based Email Campaign Tool")
 st.info("This app sends emails immediately from your logged-in Google account.")
 
-# Attempt to authenticate at the start of the script run
-gmail_service = authenticate_gmail()
+# Check if the user is already logged in and credentials are valid
+creds_valid = "google_creds" in st.session_state and st.session_state.google_creds.valid
 
-if gmail_service:
-    # --- USER IS LOGGED IN AND AUTHENTICATED ---
+# Handle the OAuth callback if the user has returned from Google
+flow = get_auth_flow()
+if flow:
+    handle_oauth_callback(flow)
+
+# --- UI LOGIC ---
+if creds_valid:
+    # --- USER IS LOGGED IN ---
+    gmail_service = build("gmail", "v1", credentials=st.session_state.google_creds)
     user_email = st.session_state.google_creds.id_token.get('email', 'Unknown User')
     st.success(f"Logged in as: {user_email}")
     st.markdown("---")
@@ -179,6 +146,16 @@ else:
     # --- USER IS NOT LOGGED IN ---
     st.header("Step 1: Log in with Google")
     st.write("You need to authorize this application to send emails on your behalf.")
-    # The login link is now displayed by the authenticate_gmail() function
-    st.info("Click the 'Login with Google' link above to proceed. A new tab may open.")
+    
+    if flow:
+        # Generate the authorization URL and state
+        authorization_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true'
+        )
+        # Store the state so we can verify it after the redirect
+        st.session_state["oauth_state"] = state
+        
+        # Display the login button as a link
+        st.link_button("Login with Google", authorization_url)
 
