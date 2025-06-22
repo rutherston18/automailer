@@ -180,8 +180,8 @@ def get_sheet_data(sheets_service, spreadsheet_id, sheet_name=None):
         return pd.DataFrame(), [], ""
 
 # --- EMAIL SENDING FUNCTIONS (UPDATED) ---
-def send_initial_email(service, to_email, subject, html_body_template, row_data, label_ids=[]):
-    """Creates, sends, and applies labels to a new email."""
+def send_initial_email(service, to_email, subject, html_body_template, row_data):
+    """Creates and sends a new email, returns the sent message object."""
     try:
         final_html_body = html_body_template.format(**row_data)
         final_subject = subject.format(**row_data)
@@ -191,12 +191,23 @@ def send_initial_email(service, to_email, subject, html_body_template, row_data,
         message["From"] = "me"
         message["Subject"] = final_subject
         encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
-        create_message = {"raw": encoded_message, "labelIds": label_ids}
+        create_message = {"raw": encoded_message} # Labels are applied after sending
         sent_message = service.users().messages().send(userId="me", body=create_message).execute()
         return sent_message 
     except Exception as e:
         st.error(f"An error occurred sending initial email to {to_email}: {e}")
         return None
+
+def apply_label_to_message(service, msg_id, label_ids_to_add):
+    """Applies a list of labels to a specific message."""
+    try:
+        modify_request = {'addLabelIds': label_ids_to_add, 'removeLabelIds': []}
+        service.users().messages().modify(userId='me', id=msg_id, body=modify_request).execute()
+        return True
+    except Exception as e:
+        st.warning(f"Could not apply label to message {msg_id}. Error: {e}")
+        return False
+
 
 def get_message_id_with_retry(service, gmail_message_id):
     """Retrieves Message-ID header with exponential backoff retry logic."""
@@ -212,8 +223,8 @@ def get_message_id_with_retry(service, gmail_message_id):
     st.warning("&nbsp;&nbsp;&nbsp;↳ Warning: Could not retrieve Message-ID after all retries")
     return ""
 
-def send_reply_email(service, to_email, subject, thread_id, original_msg_id, html_body_template, row_data, label_ids=[]):
-    """Sends a reply and applies labels."""
+def send_reply_email(service, to_email, subject, thread_id, original_msg_id, html_body_template, row_data):
+    """Sends a reply within an existing email thread."""
     try:
         final_html_body = html_body_template.format(**row_data)
         final_subject = f"Re: {subject}" if not subject.lower().startswith("re:") else subject
@@ -225,7 +236,7 @@ def send_reply_email(service, to_email, subject, thread_id, original_msg_id, htm
         message["In-Reply-To"] = original_msg_id
         message["References"] = original_msg_id
         encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
-        create_message = {"raw": encoded_message, "threadId": thread_id, "labelIds": label_ids}
+        create_message = {"raw": encoded_message, "threadId": thread_id} # Labels applied after
         sent_message = service.users().messages().send(userId="me", body=create_message).execute()
         return sent_message
     except Exception as e:
@@ -264,7 +275,7 @@ if gmail_service and sheets_service:
 
             with tab1:
                 st.subheader("Send First-Time Emails")
-                subject_input = st.text_input("Initial Email Subject", value="Association with Entrepreneurship Cell, IIT Madras || {company}", key="initial_subject")
+                subject_input = st.text_input("Initial Email Subject", value="Following up", key="initial_subject")
                 
                 selected_label_name = st.selectbox(
                     "Apply this Gmail label (optional):", 
@@ -275,7 +286,6 @@ if gmail_service and sheets_service:
                 
                 html_template = template_selector_ui("initial")
                 
-                # --- FIX: Restored the complete sending and logging logic inside the button's condition ---
                 if st.button("Start Initial Campaign"):
                     if not all([html_template, subject_input]):
                         st.warning("Please provide a subject and select/upload an HTML template.")
@@ -287,9 +297,15 @@ if gmail_service and sheets_service:
                             for i, row in df.iterrows():
                                 if pd.isna(row.get('email')) or not row.get('email'): continue
                                 st.write(f"Row {i+2}: Sending to **{row.get('email')}**...")
-                                result = send_initial_email(gmail_service, row.get('email'), subject_input, html_template, row.to_dict(), label_id_to_apply)
+                                result = send_initial_email(gmail_service, row.get('email'), subject_input, html_template, row.to_dict())
                                 if result:
-                                    sent_emails_info.append({"row_index": i, "temp_id": result['id'], "thread_id": result['threadId'], "subject": subject_input.format(**row.to_dict())})
+                                    temp_id = result['id']
+                                    # --- FIX: Apply label immediately after sending ---
+                                    if label_id_to_apply:
+                                        apply_label_to_message(gmail_service, temp_id, label_id_to_apply)
+                                        st.write(f"&nbsp;&nbsp;&nbsp;↳ Label '{selected_label_name}' applied.")
+                                    # --- END FIX ---
+                                    sent_emails_info.append({"row_index": i, "temp_id": temp_id, "thread_id": result['threadId'], "subject": subject_input.format(**row.to_dict())})
                                     st.write(f"&nbsp;&nbsp;&nbsp;↳ Success: Email sent.")
                                 else:
                                     st.error(f"&nbsp;&nbsp;&nbsp;↳ Failed to send email to {row.get('email')}.")
@@ -334,7 +350,6 @@ if gmail_service and sheets_service:
                 
                 reminder_template = template_selector_ui("reminder")
                 
-                # --- FIX: Restored the complete reminder logic inside the button's condition ---
                 if st.button("Start Reminder Campaign"):
                     if not reminder_template:
                         st.warning("Please select/upload a reminder template.")
@@ -348,16 +363,19 @@ if gmail_service and sheets_service:
                             else:
                                 with st.spinner(f"Sending reminders to {len(reply_df)} contacts..."):
                                     for i, row in reply_df.iterrows():
-                                        send_reply_email(
+                                        result = send_reply_email(
                                             gmail_service,
                                             row.get('email'),
                                             row.get('Subject'),
                                             row.get('Thread ID'),
                                             row.get('Message ID'),
                                             reminder_template,
-                                            row.to_dict(),
-                                            reply_label_id_to_apply
+                                            row.to_dict()
                                         )
+                                        # --- FIX: Apply label to replies as well ---
+                                        if result and reply_label_id_to_apply:
+                                            apply_label_to_message(gmail_service, result['id'], reply_label_id_to_apply)
+                                        # --- END FIX ---
                                     st.success("Reminder campaign sent!")
                                     st.balloons()
 else:
