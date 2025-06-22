@@ -15,7 +15,7 @@ from googleapiclient.errors import HttpError
 # We need permission to send Gmail AND read/write Sheets.
 SCOPES = ["https://www.googleapis.com/auth/gmail.send", "https://www.googleapis.com/auth/spreadsheets"]
 
-# --- AUTHENTICATION & SERVICE SETUP (UNCHANGED) ---
+# --- AUTHENTICATION & SERVICE SETUP ---
 @st.cache_resource
 def get_preauthorized_services():
     """Authenticates and returns service objects for both Gmail and Google Sheets."""
@@ -66,8 +66,6 @@ def get_sheet_data(sheets_service, spreadsheet_id):
 def update_google_sheet(sheets_service, spreadsheet_id, sheet_name, row_index, col_index, value):
     """Updates a single cell in the Google Sheet."""
     try:
-        # Excel-style cell notation, e.g., A1, B2
-        # chr(65) is 'A'. So col_index 0 becomes 'A', 1 becomes 'B', etc.
         column_letter = chr(65 + col_index)
         range_to_update = f"{sheet_name}!{column_letter}{row_index + 1}"
         body = {'values': [[value]]}
@@ -78,7 +76,7 @@ def update_google_sheet(sheets_service, spreadsheet_id, sheet_name, row_index, c
     except Exception as e:
         st.warning(f"Failed to update cell at {range_to_update}. Error: {e}")
 
-# --- EMAIL SENDING FUNCTIONS (UNCHANGED) ---
+# --- EMAIL SENDING FUNCTIONS ---
 def send_initial_email(service, to_email, subject, html_body_template, row_data):
     """Creates and sends a new personalized HTML email."""
     try:
@@ -101,13 +99,14 @@ def send_reply_email(service, to_email, subject, thread_id, original_msg_id, htm
     """Sends a reply within an existing email thread."""
     try:
         final_html_body = html_body_template.format(**row_data)
-        final_subject = f"Re: {subject}" 
+        final_subject = f"Re: {subject}" if not subject.lower().startswith("re:") else subject
         
         message = EmailMessage()
         message.add_alternative(final_html_body, subtype='html')
         message["To"] = to_email
         message["From"] = "me"
         message["Subject"] = final_subject
+        # --- These headers are now correct because we stored the proper ID ---
         message["In-Reply-To"] = original_msg_id
         message["References"] = original_msg_id
         
@@ -158,33 +157,43 @@ if gmail_service and sheets_service:
                     else:
                         html_template = uploaded_template.getvalue().decode("utf-8")
                         with st.spinner(f"Sending initial emails to {len(df)} contacts..."):
-                            # --- FIX: Ensure log columns exist before looping ---
                             log_headers = ["Timestamp", "Status", "Subject", "Thread ID", "Message ID"]
                             for header in log_headers:
                                 if header not in headers:
                                     headers.append(header)
-                            # Update the header row in the sheet if new columns were added
                             sheets_service.spreadsheets().values().update(
                                 spreadsheetId=spreadsheet_id, range=f"{sheet_name}!A1",
                                 valueInputOption="USER_ENTERED", body={'values': [headers]}
                             ).execute()
-                            # --- END FIX ---
 
                             for i, row in df.iterrows():
                                 row_data = row.to_dict()
                                 email = row_data.get('email')
-                                if not email or pd.isna(email):
-                                    continue
+                                if not email or pd.isna(email): continue
                                 
                                 final_subject = subject_input.format(**row_data)
                                 result = send_initial_email(gmail_service, email, final_subject, html_template, row_data)
+                                
                                 if result:
+                                    # --- FIX: Fetch the full Message-ID header for proper threading ---
+                                    msg_id_header = ""
+                                    try:
+                                        full_message = gmail_service.users().messages().get(
+                                            userId='me', id=result['id'], format='metadata', metadataHeaders=['Message-ID']
+                                        ).execute()
+                                        msg_headers = full_message.get('payload', {}).get('headers', [])
+                                        msg_id_header = next((h['value'] for h in msg_headers if h['name'] == 'Message-ID'), '')
+                                    except Exception as e:
+                                        st.warning(f"Could not fetch full Message-ID for {email}: {e}")
+                                    # --- END FIX ---
+                                    
                                     # Update the sheet with log data
                                     update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Timestamp"), datetime.now(pytz.timezone("Asia/Kolkata")).strftime("%Y-%m-%d %H:%M:%S"))
                                     update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Status"), "Sent")
-                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Subject"), final_subject) # <-- FIX: LOG THE SUBJECT
+                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Subject"), final_subject)
                                     update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Thread ID"), result.get('threadId'))
-                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Message ID"), result.get('id'))
+                                    update_google_sheet(sheets_service, spreadsheet_id, sheet_name, i + 1, headers.index("Message ID"), msg_id_header) # <-- Log the correct header
+                            
                             st.success("Initial campaign sent and logs updated in your Google Sheet!")
                             st.balloons()
             
@@ -200,18 +209,15 @@ if gmail_service and sheets_service:
                         st.warning("Please upload a reminder template.")
                     else:
                         reminder_template = uploaded_reminder_template.getvalue().decode("utf-8")
-                        # Filter for contacts that have been successfully emailed before
                         reply_df = df[df['Thread ID'].notna() & (df['Thread ID'] != '')].copy()
                         
-                        # --- FIX: Check if Subject column exists before filtering ---
                         if reminder_subject and 'Subject' in reply_df.columns:
                             reply_df = reply_df[reply_df['Subject'] == reminder_subject]
                         elif reminder_subject:
                             st.warning("Cannot filter by subject because the 'Subject' column was not found in your sheet.")
-                        # --- END FIX ---
 
                         if reply_df.empty:
-                            st.warning("No contacts found with a Thread ID to reply to (or matching the specified subject). Please run an initial campaign first.")
+                            st.warning("No contacts found with a Thread ID to reply to. Please run an initial campaign first.")
                         else:
                             with st.spinner(f"Sending reminders to {len(reply_df)} contacts..."):
                                 for i, row in reply_df.iterrows():
@@ -219,7 +225,7 @@ if gmail_service and sheets_service:
                                     send_reply_email(
                                         gmail_service,
                                         row_data.get('email'),
-                                        row_data.get('Subject'), # The original subject
+                                        row_data.get('Subject'),
                                         row_data.get('Thread ID'),
                                         row_data.get('Message ID'),
                                         reminder_template,
